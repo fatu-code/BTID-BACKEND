@@ -790,3 +790,52 @@ function formatFileSize(bytes) {
 app.listen(PORT, () => {
   console.log(`BTID API running on port ${PORT}`);
 });
+
+// ── SHAREABLE PLAYER LINKS ────────────────────────────────────────
+app.post('/api/players/:id/share', authMiddleware, adminOnly, async (req, res) => {
+  const { expires_hours } = req.body;
+  const hours = parseInt(expires_hours) || 48;
+  const token = require('crypto').randomBytes(32).toString('hex');
+  const expires_at = new Date(Date.now() + hours * 60 * 60 * 1000);
+  try {
+    await pool.query(`
+      INSERT INTO share_links (id, player_id, token, expires_at, created_by)
+      VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT (player_id) DO UPDATE SET
+        token = $3, expires_at = $4, created_by = $5, created_at = NOW()`,
+      [genId('SHL'), req.params.id, token, expires_at, req.user.id]
+    );
+    res.json({ token, expires_at, url: `/shared.html?token=${token}` });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/shared/:token', async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT * FROM share_links WHERE token = $1', [req.params.token]
+    );
+    const link = r.rows[0];
+    if (!link) return res.status(404).json({ error: 'Link not found' });
+    if (new Date(link.expires_at) < new Date())
+      return res.status(410).json({ error: 'LINK_EXPIRED' });
+
+    const [playerR, resultR, hvR, commR, mediaR] = await Promise.all([
+      pool.query('SELECT * FROM players WHERE id = $1', [link.player_id]),
+      pool.query('SELECT * FROM tryout_results WHERE player_id = $1', [link.player_id]),
+      pool.query('SELECT * FROM home_visits WHERE player_id = $1', [link.player_id]),
+      pool.query('SELECT * FROM comments WHERE player_id = $1 ORDER BY created_at DESC', [link.player_id]),
+      pool.query('SELECT * FROM home_visit_media WHERE player_id = $1 ORDER BY created_at DESC', [link.player_id]),
+    ]);
+
+    const hv = hvR.rows[0] || {};
+    hv.media = mediaR.rows;
+
+    res.json({
+      player:        playerR.rows[0],
+      tryout_result: resultR.rows[0] || null,
+      home_visit:    hv,
+      comments:      commR.rows,
+      expires_at:    link.expires_at,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
