@@ -145,6 +145,17 @@ app.post('/api/login', async (req, res) => {
       return res.status(403).json({ error: 'ACCOUNT_EXPIRED', message: 'Your access has expired. Contact Joshua.' });
     }
 
+    // Check if 2FA is enabled
+    if (user.totp_enabled && user.totp_secret) {
+      // Issue a short-lived temp token for the 2FA step
+      const tempToken = jwt.sign(
+        { id: user.id, username: user.username, name: user.name, role: user.role },
+        JWT_SECRET + '_2fa',
+        { expiresIn: '5m' }
+      );
+      return res.json({ requires_2fa: true, temp_token: tempToken });
+    }
+
     // Log the login
     await pool.query(
       `INSERT INTO login_log (id, user_id, username, name, role, ip, user_agent)
@@ -166,7 +177,7 @@ app.post('/api/login', async (req, res) => {
       { expiresIn: '7d' }
     );
 
-    const { password: _, ...safeUser } = user;
+    const { password: _, totp_secret: __, ...safeUser } = user;
     res.json({ token, user: safeUser });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -222,6 +233,7 @@ app.get('/api/reports', authMiddleware, async (req, res) => {
     const params = [];
     let i = 1;
     if (batch_id) { where += ` AND batch_id = $${i++}`; params.push(batch_id); }
+    if (season)   { where += ` AND season = $${i++}`;    params.push(parseInt(season)); }
     if (district) { where += ` AND district = $${i++}`; params.push(district); }
 
     const r = await pool.query(`
@@ -237,7 +249,7 @@ app.get('/api/reports', authMiddleware, async (req, res) => {
 
 // ── PLAYERS ───────────────────────────────────────────────────────
 app.get('/api/players', authMiddleware, async (req, res) => {
-  const { district, tier, outcome, batch_id, limit, sort } = req.query;
+  const { district, tier, outcome, batch_id, limit, sort, season } = req.query;
   try {
     let where = 'WHERE 1=1';
     const params = [];
@@ -251,6 +263,7 @@ app.get('/api/players', authMiddleware, async (req, res) => {
       where += ` AND outcome = $${i++}`; params.push(outcome);
     }
     if (batch_id) { where += ` AND batch_id = $${i++}`; params.push(batch_id); }
+    if (season)   { where += ` AND season = $${i++}`;    params.push(parseInt(season)); }
 
     let orderBy = 'ORDER BY created_at DESC';
     if (sort === 'name')    orderBy = 'ORDER BY name ASC';
@@ -837,5 +850,165 @@ app.get('/api/shared/:token', async (req, res) => {
       comments:      commR.rows,
       expires_at:    link.expires_at,
     });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── TWO FACTOR AUTHENTICATION ─────────────────────────────────────
+const speakeasy = require('speakeasy');
+const QRCode    = require('qrcode');
+
+// Generate 2FA secret + QR code
+app.post('/api/2fa/setup', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    const secret = speakeasy.generateSecret({
+      name:   'BTID (' + req.user.username + ')',
+      issuer: 'BTID Athlete Management',
+      length: 20,
+    });
+
+    const qrUrl = await QRCode.toDataURL(secret.otpauth_url);
+
+    // Save secret temporarily (not enabled yet until verified)
+    await pool.query('UPDATE users SET totp_secret = $1 WHERE id = $2',
+      [secret.base32, req.user.id]);
+
+    res.json({ secret: secret.base32, qr_code: qrUrl });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Verify and enable 2FA
+app.post('/api/2fa/verify', authMiddleware, adminOnly, async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'Code required' });
+  try {
+    const r = await pool.query('SELECT totp_secret FROM users WHERE id = $1', [req.user.id]);
+    const secret = r.rows[0]?.totp_secret;
+    if (!secret) return res.status(400).json({ error: 'Run setup first' });
+
+    const valid = speakeasy.totp.verify({
+      secret,
+      encoding: 'base32',
+      token:    code.replace(/\s/g, ''),
+      window:   1,
+    });
+
+    if (!valid) return res.status(400).json({ error: 'Invalid code. Try again.' });
+
+    await pool.query('UPDATE users SET totp_enabled = true WHERE id = $1', [req.user.id]);
+    res.json({ success: true, message: '2FA enabled successfully' });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Disable 2FA
+app.post('/api/2fa/disable', authMiddleware, adminOnly, async (req, res) => {
+  const { code } = req.body;
+  try {
+    const r = await pool.query('SELECT totp_secret, totp_enabled FROM users WHERE id = $1', [req.user.id]);
+    const u = r.rows[0];
+    if (!u?.totp_enabled) return res.status(400).json({ error: '2FA is not enabled' });
+
+    const valid = speakeasy.totp.verify({
+      secret:   u.totp_secret,
+      encoding: 'base32',
+      token:    code?.replace(/\s/g, '') || '',
+      window:   1,
+    });
+    if (!valid) return res.status(400).json({ error: 'Invalid code' });
+
+    await pool.query('UPDATE users SET totp_enabled = false, totp_secret = NULL WHERE id = $1', [req.user.id]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Verify 2FA code during login (second step)
+app.post('/api/2fa/login-verify', async (req, res) => {
+  const { temp_token, code } = req.body;
+  if (!temp_token || !code) return res.status(400).json({ error: 'Token and code required' });
+  try {
+    // Verify the temp token
+    let payload;
+    try { payload = jwt.verify(temp_token, JWT_SECRET + '_2fa'); }
+    catch { return res.status(401).json({ error: 'Invalid or expired session' }); }
+
+    const r = await pool.query('SELECT * FROM users WHERE id = $1', [payload.id]);
+    const user = r.rows[0];
+    if (!user) return res.status(401).json({ error: 'User not found' });
+
+    const valid = speakeasy.totp.verify({
+      secret:   user.totp_secret,
+      encoding: 'base32',
+      token:    code.replace(/\s/g, ''),
+      window:   1,
+    });
+    if (!valid) return res.status(401).json({ error: 'Invalid code. Please try again.' });
+
+    // Log the login
+    await pool.query(
+      `INSERT INTO login_log (id, user_id, username, name, role, ip, user_agent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [genId('LOG'), user.id, user.username, user.name, user.role,
+       req.ip || req.connection.remoteAddress,
+       req.headers['user-agent'] || '']
+    ).catch(() => {});
+
+    await pool.query(
+      'UPDATE users SET login_count = COALESCE(login_count,0)+1, last_login = NOW() WHERE id = $1',
+      [user.id]
+    ).catch(() => {});
+
+    const token = jwt.sign(
+      { id: user.id, username: user.username, name: user.name, role: user.role },
+      JWT_SECRET, { expiresIn: '7d' }
+    );
+    const { password: _, totp_secret: __, ...safeUser } = user;
+    res.json({ token, user: safeUser });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── SEASON / YEAR ROUTES ──────────────────────────────────────────
+app.get('/api/seasons', authMiddleware, async (req, res) => {
+  try {
+    const [pr, tr] = await Promise.all([
+      pool.query('SELECT DISTINCT season FROM players WHERE season IS NOT NULL ORDER BY season DESC'),
+      pool.query('SELECT DISTINCT season FROM tryout_batches WHERE season IS NOT NULL ORDER BY season DESC'),
+    ]);
+    const seasons = [...new Set([
+      ...pr.rows.map(r => r.season),
+      ...tr.rows.map(r => r.season),
+    ])].sort((a, b) => b - a);
+    res.json({ seasons: seasons.length ? seasons : [new Date().getFullYear()] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/stats', authMiddleware, async (req, res) => {
+  const { season } = req.query;
+  try {
+    const seasonFilter = season ? ` AND season = ${parseInt(season)}` : '';
+    const [totalR, admittedR, eliminatedR, tryoutsR, tiersR] = await Promise.all([
+      pool.query(`SELECT COUNT(*) FROM players WHERE 1=1${seasonFilter}`),
+      pool.query(`SELECT COUNT(*) FROM players WHERE outcome = 'admitted'${seasonFilter}`),
+      pool.query(`SELECT COUNT(*) FROM players WHERE outcome = 'eliminated'${seasonFilter}`),
+      pool.query(`SELECT COUNT(*) FROM tryout_batches WHERE 1=1${season ? ` AND season = ${parseInt(season)}` : ''}`),
+      pool.query(`SELECT tier, COUNT(*) as count FROM players WHERE tier IS NOT NULL${seasonFilter} GROUP BY tier`),
+    ]);
+    const tiers = {};
+    tiersR.rows.forEach(r => { tiers[r.tier] = parseInt(r.count); });
+    res.json({
+      total:      parseInt(totalR.rows[0].count),
+      admitted:   parseInt(admittedR.rows[0].count),
+      eliminated: parseInt(eliminatedR.rows[0].count),
+      tryouts:    parseInt(tryoutsR.rows[0].count),
+      tier1:  tiers['1']   || 0,
+      tier15: tiers['1.5'] || 0,
+      tier2:  tiers['2']   || 0,
+      tier3:  tiers['3']   || 0,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/account/2fa-status', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT totp_enabled FROM users WHERE id = $1', [req.user.id]);
+    res.json({ totp_enabled: r.rows[0]?.totp_enabled || false });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
