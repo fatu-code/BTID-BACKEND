@@ -5,6 +5,8 @@ const { Pool } = require('pg');
 const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
+const speakeasy = require('speakeasy');
+const QRCode    = require('qrcode');
 const multer   = require('multer');
 const path     = require('path');
 const fs       = require('fs');
@@ -851,9 +853,6 @@ app.get('/api/shared/:token', async (req, res) => {
 });
 
 // ── TWO FACTOR AUTHENTICATION ─────────────────────────────────────
-const speakeasy = require('speakeasy');
-const QRCode    = require('qrcode');
-
 // Generate 2FA secret + QR code
 app.post('/api/2fa/setup', authMiddleware, adminOnly, async (req, res) => {
   try {
