@@ -799,10 +799,7 @@ function formatFileSize(bytes) {
   return (bytes / 1024 / 1024).toFixed(1) + ' MB';
 }
 
-// ── START ─────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`BTID API running on port ${PORT}`);
-});
+// routes continue below...
 
 // ── SHAREABLE PLAYER LINKS ────────────────────────────────────────
 app.post('/api/players/:id/share', authMiddleware, adminOnly, async (req, res) => {
@@ -1097,4 +1094,9 @@ app.post('/api/players/:playerId/media/:tab', authMiddleware, adminOnly,
     const r = await pool.query('SELECT * FROM home_visit_media WHERE id = $1', [id]);
     res.status(201).json({ media: r.rows[0] });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── START ─────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`BTID API running on port ${PORT}`);
 });
