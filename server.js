@@ -1012,3 +1012,89 @@ app.get('/api/account/2fa-status', authMiddleware, async (req, res) => {
     res.json({ totp_enabled: r.rows[0]?.totp_enabled || false });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
+
+// ── PLAYER REPORTS ────────────────────────────────────────────────
+app.get('/api/players/:playerId/reports', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT * FROM player_reports WHERE player_id = $1 ORDER BY created_at DESC',
+      [req.params.playerId]
+    );
+    const rows = r.rows.map(row => ({
+      ...row,
+      attachments: row.attachments ? JSON.parse(row.attachments) : []
+    }));
+    res.json({ reports: rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/players/:playerId/reports', authMiddleware, adminOnly,
+  uploadGeneral.array('files', 10), async (req, res) => {
+  const { title, body } = req.body;
+  if (!title) return res.status(400).json({ error: 'Title required' });
+  const id = genId('RPT');
+  try {
+    const attachments = (req.files || []).map(f => ({
+      id:   uuidv4(),
+      name: f.originalname,
+      url:  '/uploads/reflections/' + f.filename,
+      size: formatFileSize(f.size),
+      type: f.mimetype,
+    }));
+    await pool.query(
+      `INSERT INTO player_reports (id, player_id, title, body, author_id, author_name, attachments)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [id, req.params.playerId, title, body||'', req.user.id, req.user.name,
+       JSON.stringify(attachments)]
+    );
+    const r = await pool.query('SELECT * FROM player_reports WHERE id = $1', [id]);
+    res.status(201).json({ report: { ...r.rows[0], attachments } });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/players/:playerId/reports/:reportId', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM player_reports WHERE id = $1', [req.params.reportId]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── INITIAL TRYOUT MEDIA ──────────────────────────────────────────
+app.get('/api/players/:playerId/initial-media', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(
+      "SELECT * FROM home_visit_media WHERE player_id = $1 AND media_tab = 'initial' ORDER BY created_at DESC",
+      [req.params.playerId]
+    );
+    res.json({ media: r.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/players/:playerId/development-media', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(
+      "SELECT * FROM home_visit_media WHERE player_id = $1 AND media_tab = 'development' ORDER BY created_at DESC",
+      [req.params.playerId]
+    );
+    res.json({ media: r.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/players/:playerId/media/:tab', authMiddleware, adminOnly,
+  upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const tab = req.params.tab; // 'initial' | 'development' | 'homevisit' | 'final'
+    const mediaUrl = '/uploads/' + req.params.playerId + '/' + req.file.filename;
+    const id = genId('MED');
+    await pool.query(
+      `INSERT INTO home_visit_media (id, player_id, url, type, filename, filesize, media_tab)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [id, req.params.playerId, mediaUrl,
+       req.file.mimetype.startsWith('video') ? 'video' : 'image',
+       req.file.originalname, req.file.size, tab]
+    );
+    const r = await pool.query('SELECT * FROM home_visit_media WHERE id = $1', [id]);
+    res.status(201).json({ media: r.rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
