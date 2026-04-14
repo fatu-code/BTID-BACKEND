@@ -229,7 +229,7 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
 
 // ── REPORTS ───────────────────────────────────────────────────────
 app.get('/api/reports', authMiddleware, async (req, res) => {
-  const { batch_id, district } = req.query;
+  const { batch_id, district, season } = req.query;
   try {
     let where = 'WHERE 1=1';
     const params = [];
