@@ -535,12 +535,21 @@ app.put('/api/tryouts/:id', authMiddleware, adminOnly, async (req, res) => {
 app.get('/api/tryouts/:id/players', authMiddleware, async (req, res) => {
   try {
     const r = await pool.query(`
-      SELECT p.*, tp.attended, tp.added_at
+      SELECT p.*,
+        tp.attended, tp.added_at,
+        tp.outcome        AS batch_outcome,
+        tp.elimination_reason AS batch_elimination_reason,
+        tp.assessed_at
       FROM tryout_players tp
       JOIN players p ON p.id = tp.player_id
       WHERE tp.batch_id = $1
       ORDER BY p.name`, [req.params.id]);
-    res.json({ players: r.rows });
+    // Use batch_outcome for display, fall back to player outcome
+    const rows = r.rows.map(p => ({
+      ...p,
+      display_outcome: p.batch_outcome || null,
+    }));
+    res.json({ players: rows });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -553,6 +562,39 @@ app.post('/api/tryouts/:id/players', authMiddleware, adminOnly, async (req, res)
     );
     await pool.query('UPDATE players SET batch_id = $1 WHERE id = $2', [req.params.id, player_id]);
     res.status(201).json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Update batch-specific outcome for a player
+app.put('/api/tryouts/:id/players/:playerId/outcome', authMiddleware, adminOnly, async (req, res) => {
+  const { outcome, elimination_reason } = req.body;
+  try {
+    await pool.query(`
+      UPDATE tryout_players
+      SET outcome = $1, elimination_reason = $2, assessed_at = NOW()
+      WHERE batch_id = $3 AND player_id = $4`,
+      [outcome, elimination_reason || null, req.params.id, req.params.playerId]
+    );
+    // Also update the player's global record
+    if (outcome === 'admitted') {
+      await pool.query(
+        "UPDATE players SET outcome = 'admitted' WHERE id = $1",
+        [req.params.playerId]
+      );
+    } else if (outcome === 'eliminated') {
+      // Only update global if player has no admitted record elsewhere
+      const check = await pool.query(
+        "SELECT id FROM tryout_players WHERE player_id = $1 AND outcome = 'admitted'",
+        [req.params.playerId]
+      );
+      if (!check.rows.length) {
+        await pool.query(
+          "UPDATE players SET outcome = 'eliminated', elimination_reason = $1 WHERE id = $2",
+          [elimination_reason || null, req.params.playerId]
+        );
+      }
+    }
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
