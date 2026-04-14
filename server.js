@@ -1137,6 +1137,36 @@ app.post('/api/players/:playerId/media/:tab', authMiddleware, adminOnly,
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── DEV NOTES LOG ────────────────────────────────────────────────
+app.get('/api/players/:playerId/dev-notes', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT * FROM dev_notes_log WHERE player_id=$1 ORDER BY created_at DESC',
+      [req.params.playerId]
+    );
+    res.json({ notes: r.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/players/:playerId/dev-notes', authMiddleware, adminOnly, async (req, res) => {
+  const { note } = req.body;
+  if (!note) return res.status(400).json({ error: 'Note is required' });
+  try {
+    const r = await pool.query(
+      'INSERT INTO dev_notes_log (player_id, note, author_id, author_name) VALUES ($1,$2,$3,$4) RETURNING *',
+      [req.params.playerId, note, req.user.id, req.user.name || req.user.username]
+    );
+    res.status(201).json({ note: r.rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.delete('/api/players/:playerId/dev-notes/:noteId', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    await pool.query('DELETE FROM dev_notes_log WHERE id=$1 AND player_id=$2', [req.params.noteId, req.params.playerId]);
+    res.json({ success: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── START ─────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`BTID API running on port ${PORT}`);
