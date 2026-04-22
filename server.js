@@ -67,15 +67,24 @@ async function uploadToStorage(file, folder) {
   const ext = path.extname(file.originalname) || '';
   const objectPath = `${folder}/${uuidv4()}${ext}`;
 
-  const { error } = await supabase.storage
+  console.log(`[UPLOAD] Starting: ${objectPath} (${file.size} bytes, ${file.mimetype})`);
+
+  const { data: uploadData, error } = await supabase.storage
     .from(STORAGE_BUCKET)
     .upload(objectPath, file.buffer, {
       contentType: file.mimetype,
       upsert: false,
     });
-  if (error) throw new Error('Storage upload failed: ' + error.message);
+
+  if (error) {
+    console.error(`[UPLOAD] FAILED for ${objectPath}:`, error);
+    throw new Error('Storage upload failed: ' + error.message);
+  }
+
+  console.log(`[UPLOAD] Success:`, uploadData);
 
   const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(objectPath);
+  console.log(`[UPLOAD] Public URL: ${data.publicUrl}`);
   return { url: data.publicUrl, path: objectPath };
 }
 
@@ -114,7 +123,7 @@ function adminOnly(req, res, next) {
 
 // ── HEALTH ────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ message: 'BTID Athlete Management System API', version: '1.0.0', status: 'running' });
+  res.json({ message: 'BTID Athlete Management System API', version: '1.1.0-supabase', status: 'running' });
 });
 
 // ── SEED ──────────────────────────────────────────────────────────
