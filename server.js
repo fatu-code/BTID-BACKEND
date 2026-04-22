@@ -1100,6 +1100,29 @@ app.delete('/api/players/:playerId/reports/:reportId', authMiddleware, adminOnly
 });
 
 // ── INITIAL TRYOUT MEDIA ──────────────────────────────────────────
+// ── METRICS HISTORY ──────────────────────────────────────────────
+app.get('/api/players/:playerId/metrics-history', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(
+      'SELECT * FROM metrics_history WHERE player_id = $1 ORDER BY created_at DESC LIMIT 20',
+      [req.params.playerId]
+    );
+    res.json({ history: r.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/players/:playerId/metrics-history', authMiddleware, adminOnly, async (req, res) => {
+  const { velo, height_ft, weight_lbs, broad, dash, kr } = req.body;
+  try {
+    const r = await pool.query(
+      `INSERT INTO metrics_history (id, player_id, velo, height_ft, weight_lbs, broad, dash, kr, noted_by)
+       VALUES (gen_random_uuid()::text, $1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [req.params.playerId, velo||null, height_ft||null, weight_lbs||null, broad||null, dash||null, kr||null, req.user.name||req.user.username]
+    );
+    res.json({ entry: r.rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/players/:playerId/initial-media', authMiddleware, async (req, res) => {
   try {
     const r = await pool.query(
