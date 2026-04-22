@@ -35,7 +35,7 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY,
   { auth: { persistSession: false } }
 );
-const STORAGE_BUCKET = 'btid-media';
+const STORAGE_BUCKET = 'BTID MEDIA';
 
 // ── MIDDLEWARE ────────────────────────────────────────────────────
 app.use(cors({ origin: '*', credentials: false }));
