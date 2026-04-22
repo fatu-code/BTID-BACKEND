@@ -9,7 +9,7 @@ const speakeasy = require('speakeasy');
 const QRCode    = require('qrcode');
 const multer   = require('multer');
 const path     = require('path');
-const fs       = require('fs');
+const { createClient } = require('@supabase/supabase-js');
 
 const app  = express();
 const PORT = process.env.PORT || 3001;
@@ -21,42 +21,35 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+// ── SUPABASE STORAGE ──────────────────────────────────────────────
+// Files are uploaded to the `btid-media` public bucket in Supabase Storage.
+// Railway's filesystem is ephemeral (wipes on redeploy), so persistent
+// storage MUST live outside the container. The service_role key bypasses
+// bucket policies — backend-only, never expose to frontend.
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_KEY) {
+  console.error('FATAL: SUPABASE_URL and SUPABASE_SERVICE_KEY env vars are required');
+  process.exit(1);
+}
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY,
+  { auth: { persistSession: false } }
+);
+const STORAGE_BUCKET = 'btid-media';
+
 // ── MIDDLEWARE ────────────────────────────────────────────────────
 app.use(cors({ origin: '*', credentials: false }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// Serve uploaded files
-const uploadDir = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-app.use('/uploads', express.static(uploadDir));
-
-// ── MULTER STORAGE ────────────────────────────────────────────────
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dir = path.join(uploadDir, req.params.playerId || 'general');
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname);
-    cb(null, uuidv4() + ext);
-  },
-});
+// ── MULTER (memory storage) ───────────────────────────────────────
+// Files stay in RAM as buffers; we push to Supabase Storage in the route.
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 }, // 100MB for videos
 });
-
 const uploadGeneral = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => {
-      const dir = path.join(uploadDir, 'reflections');
-      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      cb(null, dir);
-    },
-    filename: (req, file, cb) => cb(null, uuidv4() + path.extname(file.originalname)),
-  }),
+  storage: multer.memoryStorage(),
   limits: { fileSize: 50 * 1024 * 1024 },
 });
 
@@ -65,9 +58,38 @@ function genId(prefix) {
   return prefix + '-' + Date.now() + '-' + Math.random().toString(36).substr(2, 5);
 }
 
-function getFileUrl(req, filePath) {
-  if (process.env.FILE_BASE_URL) return process.env.FILE_BASE_URL + '/' + filePath;
-  return req.protocol + '://' + req.get('host') + '/uploads/' + filePath;
+/**
+ * Upload an in-memory file buffer to Supabase Storage.
+ * Returns the full public URL to save in the DB.
+ * Throws on failure (caller should catch and 500).
+ */
+async function uploadToStorage(file, folder) {
+  const ext = path.extname(file.originalname) || '';
+  const objectPath = `${folder}/${uuidv4()}${ext}`;
+
+  const { error } = await supabase.storage
+    .from(STORAGE_BUCKET)
+    .upload(objectPath, file.buffer, {
+      contentType: file.mimetype,
+      upsert: false,
+    });
+  if (error) throw new Error('Storage upload failed: ' + error.message);
+
+  const { data } = supabase.storage.from(STORAGE_BUCKET).getPublicUrl(objectPath);
+  return { url: data.publicUrl, path: objectPath };
+}
+
+/**
+ * Delete an object from Supabase Storage by its full public URL.
+ * Safe: does nothing if URL doesn't match the expected format.
+ */
+async function deleteFromStorage(publicUrl) {
+  if (!publicUrl || typeof publicUrl !== 'string') return;
+  const marker = `/storage/v1/object/public/${STORAGE_BUCKET}/`;
+  const idx = publicUrl.indexOf(marker);
+  if (idx === -1) return;   // legacy /uploads/... url or external — ignore
+  const objectPath = publicUrl.substring(idx + marker.length);
+  await supabase.storage.from(STORAGE_BUCKET).remove([objectPath]);
 }
 
 // ── AUTH MIDDLEWARE ───────────────────────────────────────────────
@@ -357,10 +379,10 @@ app.post('/api/players/:playerId/photo', authMiddleware, adminOnly,
   upload.single('photo'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
-    const photoUrl = '/uploads/' + req.params.playerId + '/' + req.file.filename;
+    const { url } = await uploadToStorage(req.file, `players/${req.params.playerId}`);
     await pool.query('UPDATE players SET photo_url = $1 WHERE id = $2',
-      [photoUrl, req.params.playerId]);
-    res.json({ photo_url: photoUrl });
+      [url, req.params.playerId]);
+    res.json({ photo_url: url });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -406,12 +428,12 @@ app.post('/api/players/:playerId/home-visit/media', authMiddleware, adminOnly,
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const { type } = req.body;
-    const mediaUrl = '/uploads/' + req.params.playerId + '/' + req.file.filename;
+    const { url } = await uploadToStorage(req.file, `players/${req.params.playerId}`);
     const id = genId('MED');
     await pool.query(
       `INSERT INTO home_visit_media (id, player_id, url, type, filename, filesize)
        VALUES ($1,$2,$3,$4,$5,$6)`,
-      [id, req.params.playerId, mediaUrl, type||'image',
+      [id, req.params.playerId, url, type||'image',
        req.file.originalname, req.file.size]
     );
     const r = await pool.query('SELECT * FROM home_visit_media WHERE id = $1', [id]);
@@ -423,8 +445,9 @@ app.delete('/api/players/:playerId/home-visit/media/:mediaId', authMiddleware, a
   try {
     const r = await pool.query('SELECT * FROM home_visit_media WHERE id = $1', [req.params.mediaId]);
     if (r.rows[0]) {
-      const filePath = path.join(uploadDir, r.rows[0].url.replace('/uploads/', ''));
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      // Best-effort: delete the Storage object. If it was a legacy /uploads/... URL,
+      // deleteFromStorage() is a no-op (the file was wiped by Railway long ago).
+      try { await deleteFromStorage(r.rows[0].url); } catch (_) { /* swallow */ }
     }
     await pool.query('DELETE FROM home_visit_media WHERE id = $1', [req.params.mediaId]);
     res.json({ success: true });
@@ -747,12 +770,16 @@ app.post('/api/reflections', authMiddleware, adminOnly,
   if (!title) return res.status(400).json({ error: 'Title required' });
   const id = genId('REF');
   try {
-    const attachments = (req.files || []).map(f => ({
-      id: uuidv4(),
-      name: f.originalname,
-      url:  '/uploads/reflections/' + f.filename,
-      size: formatFileSize(f.size),
-    }));
+    const attachments = [];
+    for (const f of (req.files || [])) {
+      const { url } = await uploadToStorage(f, 'reflections');
+      attachments.push({
+        id: uuidv4(),
+        name: f.originalname,
+        url,
+        size: formatFileSize(f.size),
+      });
+    }
 
     await pool.query(
       `INSERT INTO reflections (id, title, body, type, author_id, author_name, attachments)
@@ -1074,13 +1101,17 @@ app.post('/api/players/:playerId/reports', authMiddleware, adminOnly,
   if (!title) return res.status(400).json({ error: 'Title required' });
   const id = genId('RPT');
   try {
-    const attachments = (req.files || []).map(f => ({
-      id:   uuidv4(),
-      name: f.originalname,
-      url:  '/uploads/reflections/' + f.filename,
-      size: formatFileSize(f.size),
-      type: f.mimetype,
-    }));
+    const attachments = [];
+    for (const f of (req.files || [])) {
+      const { url } = await uploadToStorage(f, `players/${req.params.playerId}/reports`);
+      attachments.push({
+        id:   uuidv4(),
+        name: f.originalname,
+        url,
+        size: formatFileSize(f.size),
+        type: f.mimetype,
+      });
+    }
     await pool.query(
       `INSERT INTO player_reports (id, player_id, title, body, author_id, author_name, attachments)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
@@ -1148,12 +1179,12 @@ app.post('/api/players/:playerId/media/:tab', authMiddleware, adminOnly,
   try {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
     const tab = req.params.tab; // 'initial' | 'development' | 'homevisit' | 'final'
-    const mediaUrl = '/uploads/' + req.params.playerId + '/' + req.file.filename;
+    const { url } = await uploadToStorage(req.file, `players/${req.params.playerId}/${tab}`);
     const id = genId('MED');
     await pool.query(
       `INSERT INTO home_visit_media (id, player_id, url, type, filename, filesize, media_tab)
        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [id, req.params.playerId, mediaUrl,
+      [id, req.params.playerId, url,
        req.file.mimetype.startsWith('video') ? 'video' : 'image',
        req.file.originalname, req.file.size, tab]
     );
