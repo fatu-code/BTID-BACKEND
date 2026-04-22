@@ -317,7 +317,9 @@ app.put('/api/players/:id', authMiddleware, adminOnly, async (req, res) => {
     'dad_ht','mom_ht','gender','gphp','scout','tier','notes','kr',
     'velo','height_ft','weight_lbs','outcome','elimination_reason',
     'academy','coach_assigned','next_checkin','guardian_consent','dev_notes',
-    'photo_url','batch_id','attended','age'
+    'photo_url','batch_id','attended','age',
+    'dev_velo','dev_height_ft','dev_weight_lbs','dev_broad','dev_dash','dev_kr',
+    'init_velo','init_height_ft','init_notes'
   ];
   const updates = [];
   const params  = [];
