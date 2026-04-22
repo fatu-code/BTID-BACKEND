@@ -395,6 +395,25 @@ app.post('/api/players/:playerId/photo', authMiddleware, adminOnly,
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── PLAYER PHOTO REMOVE ───────────────────────────────────────────
+// Clears the photo_url column and best-effort deletes the object from Storage.
+// Safe to call when there's no current photo (it becomes a no-op DB update).
+app.delete('/api/players/:playerId/photo', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    const r = await pool.query('SELECT photo_url FROM players WHERE id = $1',
+      [req.params.playerId]);
+    if (!r.rows.length) return res.status(404).json({ error: 'Player not found' });
+
+    const oldUrl = r.rows[0].photo_url;
+    if (oldUrl) {
+      try { await deleteFromStorage(oldUrl); } catch (_) { /* best-effort */ }
+    }
+    await pool.query('UPDATE players SET photo_url = NULL WHERE id = $1',
+      [req.params.playerId]);
+    res.json({ success: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── HOME VISIT ────────────────────────────────────────────────────
 app.get('/api/players/:playerId/home-visit', authMiddleware, async (req, res) => {
   try {
