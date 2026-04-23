@@ -1202,6 +1202,16 @@ app.get('/api/players/:playerId/development-media', authMiddleware, async (req, 
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+app.get('/api/players/:playerId/final-media', authMiddleware, async (req, res) => {
+  try {
+    const r = await pool.query(
+      "SELECT * FROM home_visit_media WHERE player_id = $1 AND media_tab = 'final' ORDER BY created_at DESC",
+      [req.params.playerId]
+    );
+    res.json({ media: r.rows });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.post('/api/players/:playerId/media/:tab', authMiddleware, adminOnly,
   upload.single('file'), async (req, res) => {
   try {
